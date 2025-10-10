@@ -1,0 +1,612 @@
+---
+title: "Bayesian Methods"
+author: "I. Liolios, K. Semathea, A.-F. Ducheine, M. Loni, T. Ghaneh"
+date: "2025-10-10"
+output: 
+    bookdown::html_document2:
+        number_sections: true
+        highlight: tango           
+        toc: true               
+        toc_float: true   
+---
+
+# Introduction 
+
+This experiment was conducted to investigate how a growth regulator influences seed production in two varieties of oilseed rape. The response variable, Thousand Grain Weight (TGW), measures seed size and serves as an indicator of yield quality. During the growing season, pigeon grazing occurred in some plots, and the affected area was recorded as Damage (percentage grazed). Because this damage could influence plant growth and seed development, it is included as a covariate in the analysis.
+
+The study followed a completely randomized design (CRD) with four treatment combinations, formed by two levels of the growth regulator (+/-) and two varieties (B and N). These are represented by a single treatment factor (Trt) with four levels: (+B), (+N), (-B), and (-N). Each treatment combination was replicated six times, resulting in a total of 24 plots.
+
+The aim of this report is to compare the treatment effects on TGW while accounting for variation caused by pigeon damage. The report includes an initial exploration and summarisation of the data, followed by a description of the modelling approach and the construction of Bayesian models in brms. Model fit and convergence are examined and summarised, after which model assumptions are validated. Finally, the results are interpreted and discussed, and the main conclusions are reported.
+
+```{r setup, include=FALSE, echo = F, message = F}
+knitr::opts_chunk$set(echo = TRUE)
+
+set.seed(12345678)
+
+library(tidyverse) # Data manipulation
+library(forcats) # Factor manipulations
+library(ggplot2) # Plotting
+library(ggdist) # Uncertainty visualisation
+library(latex2exp) # LaTeX labels
+library(brms) # Bayesian fitting
+library(tidybayes) # Manipulate and visualise posterior draws
+library(emmeans) # Marginal means etc
+library(performance) # Some further helpers
+library(readr)
+library(janitor)
+library(skimr)
+library(lattice)
+library(ggthemes)      # for theme_fivethirtyeight (optional)
+library(viridisLite)   # colourblind-friendly palette
+library(broom)
+library(effects) 
+library(mgcv) 
+library(sjPlot)
+library(coda)
+library(bayesplot)
+library(ggmcmc)
+library(patchwork)
+```
+
+
+## Summary statistics and null values
+
+We load & clean the TGW dataset:
+
+```{r loading and cleaning}
+#setwd("~/Stats & Data Science Year 2/Bayesian Methods 2/Assignment") #set your directory
+
+# columns in the brief: Plot, GR, Variety, Trt, Damage, TGW
+tgw_raw <- read.table("TGW.DAT", header = TRUE) %>%
+  as_tibble() %>%
+  clean_names()
+
+# keeping only variables used in this analysis
+tgw <- tgw_raw %>%
+  select(plot, gr, variety, trt, damage, tgw) %>%
+  mutate(
+    # ensuring types are correct
+    plot    = as.integer(plot),
+    trt     = factor(trt, levels = c("-B", "-N", "+B", "+N")),  # growth reg (+/-) x variety (B/N)
+    damage  = as.numeric(damage),
+    tgw     = as.numeric(tgw)
+  )
+
+
+# quick sanity checks
+stopifnot(all(!is.na(tgw$trt)))
+stopifnot(all(dplyr::between(tgw$damage, 0, 100)))  # damage = % area grazed
+```
+
+
+We check for missing values, and examine the basic structure of the data:
+
+```{r checking missing values and structure, warning= FALSE}
+# overall missingness
+tgw %>% summarise(across(everything(), ~ sum(is.na(.)))) %>% print()
+
+# skimming for quick overview (types, missingness, distributions)
+skim(tgw)
+```
+
+The missing values check above shows that the dataset is complete with no missing observations. Variable types are correctly assigned, and the data structure matches the expected CRD design with 24 plots and four treatment groups. `Damage` ranges from 0-60% (mean $\approx$ 30.8) and `TGW` from 3.14-5.02 (mean $\approx$ 3.69), indicating reasonable variation and no apparent outliers.
+
+We compute the basic summary statistics for our datatset, both for the overall population, but also faceted by the treatment groups.
+
+### Overall
+
+```{r overall tgw summary stats}
+tgw %>%
+  summarise(
+    n = n(),
+    mean_tgw = mean(tgw, na.rm = TRUE),
+    sd_tgw   = sd(tgw, na.rm = TRUE),
+    min_tgw  = min(tgw, na.rm = TRUE),
+    q1_tgw   = quantile(tgw, 0.25, na.rm = TRUE),
+    med_tgw  = median(tgw, na.rm = TRUE),
+    q3_tgw   = quantile(tgw, 0.75, na.rm = TRUE),
+    max_tgw  = max(tgw, na.rm = TRUE)
+  ) %>% print()
+
+
+```
+
+The summary statistics above show that `TGW` values range from 3.14 to 5.02, with a mean of 3.69 and a standard deviation of 0.51. The quartiles (3.33, 3.58, 3.91) suggest a fairly symmetric distribution around the mean, with no clear indication of skewness or outliers. Overall, TGW shows moderate variability across plots, which is sufficient for detecting potential treatment and damage effects.
+
+
+### By treatment
+
+```{r treatment tgw summary stats, echo = F}
+tgw_by_trt <- tgw %>%
+  group_by(trt) %>%
+  summarise(
+    n = n(),
+    mean_tgw = mean(tgw, na.rm = TRUE),
+    sd_tgw   = sd(tgw, na.rm = TRUE),
+    min_tgw  = min(tgw, na.rm = TRUE),
+    med_tgw  = median(tgw, na.rm = TRUE),
+    max_tgw  = max(tgw, na.rm = TRUE),
+    mean_damage = mean(damage, na.rm = TRUE),
+    sd_damage   = sd(damage, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(tgw_by_trt)
+```
+
+The treatment-wise summaries show clear differences in both `TGW` and `Damage` across treatment combinations. The mean TGW ranges from 3.36 (-B) to 4.27 (-N), suggesting that the `N` variety without growth regulator tends to produce the heaviest grains. Variation within treatments is modest overall, though slightly higher for `-N`.
+
+Average `Damage` levels also vary between treatments, with `+N` plots showing the highest mean grazing ($\approx$ 48%) compared to around 23–28% in the others. This imbalance highlights the importance of accounting for `Damage` as a covariate in the analysis, since differences in pigeon grazing could confound treatment effects on `TGW`.
+
+
+## Visualisation
+
+### TGW Distribution
+
+#### Entire dataset
+
+```{r histogram of tgw overall, echo = F}
+cb_pal <- viridisLite::viridis(4)  # colourblind-friendly 
+
+# histogram of tgw overall
+ggplot(tgw, aes(x = tgw)) +
+  geom_histogram(bins = 12, fill = cb_pal[3], color = "white") +
+  labs(title = "Distribution of Thousand Grain Weight (TGW)",
+       x = "TGW", y = "Count") +
+  theme_minimal(base_size = 12)
+```
+
+
+The histogram above shows the overall distribution of Thousand Grain Weight (TGW) across all treatment combinations. TGW values cluster mainly between 3.3 and 4.0, with a few higher values up to around 5.0. The distribution appears slightly right-skewed, indicating that most plots produced relatively lighter grains, while a small number achieved higher weights. 
+
+#### Grouped by treatment
+
+```{r boxplot of tgw by treatment + jittered, echo = F} 
+# boxplot of twg by treatment 
+ggplot(tgw, aes(x = trt, y = tgw, fill = trt)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(aes(color = trt), width = 0.15, height = 0, alpha = 0.7, size = 2, show.legend = FALSE) +
+  scale_fill_manual(values = cb_pal, guide = "none") +
+  scale_color_manual(values = cb_pal, guide = "none") +
+  labs(title = "TGW by Treatment",
+       x = "Treatment (Trt)", y = "TGW") +
+  theme_minimal(base_size = 12)
+```
+
+
+The boxplot above visualizes `TGW` across treatments, clearly highlighting differences between the four groups. The `-N` treatment stands out with both the highest median TGW and the largest spread, while `-B` has the lowest values and minimal variation. Treatments with the growth regulator (`+B` and `+N`) fall in between, with similar medians but slightly different dispersions.
+
+The jittered points show that observations are evenly distributed within each group, with no visible outliers. Overall, the plot suggests that both variety and growth regulator may influence grain weight, and the `-N` treatment appears most productive in terms of TGW.
+
+### TGW vs Damage
+
+#### Entire dataset
+
+```{r scatterplot tgw vs damage , echo = F}
+# scatterplot tgw vs damage (overall)
+ggplot(tgw, aes(x = damage, y = tgw)) +
+  geom_point(alpha = 0.75, size = 2, color = cb_pal[2]) +
+  labs(title = "TGW vs Damage (%)",
+       x = "Damage (% area grazed)", y = "TGW") +
+  theme_minimal(base_size = 12)
+```
+
+The scatterplot above shows a clear negative relationship between `TGW` and `Damage` across all land plots. As the percentage of grazed area increases, the thousand grain weight tends to decrease.
+
+#### Grouped by treatment
+
+```{r scatterplot tgw vs damage by treatment, echo = F}
+# scatterplot TGW vs Damage by treatment with separate trends
+ggplot(tgw, aes(x = damage, y = tgw, color = trt)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = cb_pal, name = "Treatment (Trt)") +
+  facet_wrap(~trt) +
+  labs(title = "TGW vs Damage by Treatment",
+       x = "Damage (%)", y = "TGW") +
+  theme(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+The scatterplot above shows the relationship between TGW and Damage for each treatment separately. Across most treatments, there is a general downward trend, indicating that higher grazing damage generally leads to lower grain weight. The negative relationship is strongest for `+N` and `-N`, while the `-B` treatment shows a nearly flat (or slightly positive) trend. 
+
+Final conclusion:
+
+The exploratory analysis shows that the data are complete and match the expected CRD setup (four treatments × six replicates). TGW ranges from about 3.1 to 5.0, while Damage varies between 0 and 60%. Mean TGW differs across treatments, with (-N) showing the highest values and (-B) the lowest. Damage levels also vary, especially for (+N), which had more grazing on average. The negative correlation between TGW and Damage is clear in both the summary and plots, suggesting that higher pigeon damage reduces grain weight. These patterns point to Treatment and Damage as key factors to include in the later modeling step.
+
+
+# Analysis
+
+## Data preparation
+
+```{r, echo = F, message= FALSE}
+tgw <- read.table("TGW.dat", header = TRUE)
+```
+
+We center `Damage` to improve model interpretability and set up `Trt` as a factor with sum-to-zero contrasts for ANCOVA.
+
+```{r}
+# Centre Damage
+tgw <- tgw %>% mutate(Damage_c = Damage - mean(Damage))
+
+# factor + sum-to-zero contrasts
+tgw$Trt <- factor(tgw$Trt, levels = c("-B","-N","+B","+N"))
+contrasts(tgw$Trt) <- contr.sum(nlevels(tgw$Trt))
+
+ # scatter_facet
+```
+
+We compute the mean of `TGW` (denoted \(m_y\)), the standard deviation of `TGW` (denoted \(s_y\)) and the standard deviation of `Damage` (denoted \(s_x\)). 
+These will be used in defining the priors for our models.
+
+
+```{r, results='hide', message= FALSE}
+# Auxiliary quantities
+m_y <- mean(tgw$TGW)
+std_y <- sd(tgw$TGW)
+std_x <- sd(tgw$Damage)
+
+m_y;std_y;std_x
+3 * std_y / std_x
+```
+
+## First model (ANCOVA)
+
+The first model we use is the ANCOVA model. Here, we assume that each treatment group has a its own effect on `TGW`, and that `Damage` affects `TGW` in the same way across each group. In addition, we assume that all observations contain Gaussian noise which is independent and identically distributed. The motivation for choosing this model follows naturally from the observations made during the exploratory analysis.
+
+1. The mean `TGW` of each treatment group differs
+2. `Damage` seems to affect `TGW`, and this effect follows (roughly) the same pattern across groups.
+
+Formally, the mathematical model for the ANCOVA is:
+
+$$
+\text{TGW}_{ij} = \alpha + \delta_{g[i]} + \beta\,\text{Damage}_{ij} + \varepsilon_{ij}, \qquad
+\varepsilon_{ij} \sim \mathcal{N}(0, \sigma^2)
+$$
+
+where  
+- $\alpha$ is the overall intercept (grand mean),  
+- $\delta_{g[i]}$ is the effect of treatment group $g$ (group-specific deviation),  
+- $\beta$ is the common slope describing the effect of `Damage` on `TGW`,  
+- $\sigma$ is the residual standard deviation.  
+
+### Prior choices 
+
+We keep priors in real units of TGW and scale them using simple rules-of-thumb,(intercept around the overall mean, slope scaled by 3*sd(y)/sd(x)). For the prior of variance, we use a non-negative distribution (Exponential). Furthermore, for $\beta$, we use a Normal distribution centered around a small negative value, as we observed a negative trend between TGW and Damage in the data exploration part. 
+
+Formally:
+
+- \(\alpha \sim \text{Normal}(\mu_y,\ 2\,s_y)\)
+- \(\delta_g \sim \text{Normal}(0,\ 0.6\,s_y)\)
+- \(\beta \sim \text{Normal}(0,\ 3*s_y/s_x)\)
+- \(\sigma \sim \text{Exponential}(1/s_y)\)
+
+```{r}
+
+prior_dros <- c(set_prior("normal(0, 0.3)", class = "b"),
+                set_prior("normal(3.69, 1)", class = "b", coef = "Intercept"),
+                set_prior("normal(0, 0.08)", class = "b", coef = "Damage_c"),
+                set_prior("exponential(1.0 / 0.5)", class = "sigma", lb = 0)
+                )
+```
+
+### Model fit and summary
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Fit the model
+bayesian_dros <- brm(formula = TGW ~ 0 + Intercept + Trt + Damage_c,
+                     data = tgw,
+                     prior = prior_dros,
+                     seed = 12345678,
+                     control = list(adapt_delta = 0.9)
+                     )
+
+```
+
+We fit the model with the specified priors and review its summary. 
+```{r}
+# Check fits
+summary(bayesian_dros)
+
+```
+
+First, we observe that `R_hat` is close to 1 in every case, indicating that the Markov chains have converged properly. In addition, the effective sample size (`ESS`) is large, which is also a good sign of efficient mixing and reliable estimation of the posterior distributions.
+
+
+### Fit diagnostics
+
+We would like to assess how well our model's predictions matches our data. To achieve this, we generate observations from the inferred posterior, and we plot them against our observations. This approach is called a Posterior Predictive Check. 
+
+```{r, echo = F, message=FALSE, warning=FALSE}
+pp_check(bayesian_dros, type = "scatter_avg") 
+
+pp_check(bayesian_dros, type = "scatter_avg_grouped", group = "Trt")
+```
+
+A good fit would be indicated by the points lying at (or near) the main diagonal of the plot. We see that for the most part, the points are randomly scattered around this diagonal without any strong deviations. The two furthermost right points deviate from this pattern. This could be an indication of heteroskedasticity, as variance technically increases as the values increase. However, there is a very large gap (in the x-axis) between those two points and the rest of the samples, so we are unable to concretely conclude this.
+
+We also perform residual checks, to confirm whether the ANCOVA assumption of independent and identically distributed (iid) Gaussian errors holds. We achieve this using a residual plot and a QQ plot.
+
+
+```{r, echo = F}
+## Diagnostics
+
+diagnostics_df <- tgw
+
+diagnostics_df$fitted <- fitted(bayesian_dros)[, 1]
+diagnostics_df$residuals <- residuals(bayesian_dros)[, 1]
+
+# Q-Q plot
+
+diagnostics_df %>%
+  ggplot(aes(sample = residuals)) +
+  geom_qq() +
+  geom_qq_line(colour = "red")
+  
+# Residuals vs fitted
+
+diagnostics_df %>%
+  ggplot() +
+  geom_point(aes(x = fitted, y = residuals)) 
+
+
+```
+
+From the residual plot, we see that the errors are randomly scattered above and below the `y = 0` line, without a discernible pattern or trend. In addition, the QQ plot shows that most values lay on the main diagonal, with some deviations spotted solely on the tails. These results are supportive evidence of iid Gaussian error terms, and we can conclude that we have a "healthy" fit which follows the model's assumptions.
+
+
+We would also like to see how well our fit captures the observed `TGW~Damage` relationship under different treatments.
+```{r, message=FALSE, warning=FALSE}
+
+## Plot estimates
+
+conditions <- make_conditions(data.frame(Trt = c("-B", "-N", "+B", "+N")),
+                              vars = c("Trt")
+                              )
+
+bayesian_dros_ceffs <- conditional_effects(bayesian_dros, effects = "Damage_c",
+                                           conditions = conditions
+                                           )
+
+plot(bayesian_dros_ceffs, points = TRUE) 
+
+
+```
+
+The regression lines are mostly satisfactory. There are issues in areas where, for the same damage, we measure different TGW. This can be attributed to the data limitations (small sample size, `Damage` is roughly rounded). 
+
+Before we move on to interpreting our results, we will fit another model and compare the two using LOO cross-validation. 
+
+
+## Model 2 (Hierarchical model with interaction term)
+
+The second model we fit is a hierarchical model with varying intercepts and slopes for each treatment group. This allows us to account for potential differences in the relationship between `Damage` and `TGW` across treatments, and allows for greater flexibility over fixed effects. In addition, it allows for partial pooling between group parameters, which can improve estimates when data is sparse. The motivation for this model is:
+
++ The relationship `Damage` and `TGW` slightly differs between groups, and we would like to see if we can model it better.
++ We have a very small sample size per group (n = 6), so partial pooling can help increase the information for the estimation of the parameters. 
+
+Formally, the model can be written as:
+
+$$
+\text{TGW}_{ij} = \alpha + \delta_{g[i]} + (\beta + \gamma_{g[i]})\,\text{Damage}_{ij} + \varepsilon_{ij},
+\qquad
+\varepsilon_{ij} \sim \mathcal{N}(0, \sigma^2)
+$$
+where  
+- $\alpha$ is the global intercept (grand mean),  
+- $\delta_{g[i]}$ is the deviation of treatment group $g$ from the global intercept,  
+- $\beta$ is the global slope for `Damage`,  
+- $\gamma_{g[i]}$ is the deviation of treatment group $g$ from the global slope,  
+- $\sigma$ is the residual standard deviation.  
+
+### Prior choices 
+
+Again, we calculate auxiliary quantities from the data to help us set reasonable priors.
+```{r Aux_SetPrior, results='hide', message=FALSE, warning=FALSE}
+
+# Calculating auxiliary quantities from data
+m_y <- mean(tgw$TGW)        # mean of response variable (for centering Intercept prior)
+std_y <- sd(tgw$TGW)        # standard deviation of response variable
+std_x <- sd(tgw$Damage_c)   # sd of the covariate (centred Damage)
+
+m_y; std_y; std_x
+3 * std_y / std_x            # approximate scaling factor for slope priors
+
+
+# Scaling for slopes ~ 3 * sd_y / sd_x
+slope_scale <- round(3 * std_y / std_x, 2)
+
+```
+
+
+We use weakly-informative priors, scaled in the real units of `TGW`. We present the full data generating process, including the priors:
+
+\[
+\begin{aligned}
+\alpha &\sim \mathcal{N}(\mu_y,\, 3\,s_y) \\[2pt]
+\beta &\sim \mathcal{N}\!\left(0,\, 3\,\frac{s_y}{s_x}\right) \\[2pt]
+\sigma &\sim \text{Exponential}\!\left(\frac{1}{s_y}\right) \\[2pt]
+\sigma_\delta &\sim \mathcal{N}(0,\, 3\,s_y) \\[2pt]
+\sigma_\gamma &\sim \mathcal{N}\!\left(0,\, 3\,\frac{s_y}{s_x}\right) \\[2pt]
+\delta_g \mid \sigma_\delta &\sim \mathcal{N}(0,\, \sigma_\delta^2) \\[2pt]
+\gamma_g \mid \sigma_\gamma &\sim \mathcal{N}(0,\, \sigma_\gamma^2)
+\end{aligned}
+\]
+
+This formulation allows intercepts and slopes to vary by treatment, while sharing information through the multivariate normal prior on $(\delta_g, \gamma_g)$.
+
+### Model fit and summary
+
+```{r, results = 'hide', message=FALSE, warning=FALSE}
+formula_h2 <- bf(TGW ~ 1 + (1 | Trt) + Damage_c + (0 + Damage_c | Trt))
+# (equivalent compact form: bf(TGW ~ 1 + Damage_c + (1 + Damage_c | Trt)))
+
+
+prior_h2 <- c(
+  # Intercept (fixed): mean TGW with ~3*SD spread 
+  set_prior(paste0("normal(", round(m_y, 2), ", ", round(3 * std_y, 2), ")"),
+            class = "Intercept"),
+
+  # Fixed slope for Damage_c: centered at 0, data-scaled SD
+  set_prior(paste0("normal(0, ", slope_scale, ")"),
+            class = "b", coef = "Damage_c"),
+
+  # Residual SD: exponential with mean = std_y 
+  set_prior(paste0("exponential(1.0 / ", round(std_y, 2), ")"),
+            class = "sigma", lb = 0),
+
+  # Random-intercept SD for Trt (hierarchy on group means): Normal(0, ~3*std_y)
+  set_prior(paste0("normal(0, ", round(3 * std_y, 2), ")"),
+            class = "sd", group = "Trt", coef = "Intercept"),
+
+  # Random-slope SD for Damage_c by Trt (hierarchical interaction): Normal(0, slope_scale)
+  set_prior(paste0("normal(0, ", slope_scale, ")"),
+            class = "sd", group = "Trt", coef = "Damage_c")
+)
+
+
+bayesian_h2 <- brm(
+  formula = formula_h2,
+  data    = tgw,
+  prior   = prior_h2,
+  seed    = 12345678,
+  control = list(adapt_delta = 0.995, max_treedepth = 15)   # raising adapt_delta for hierarchical 
+)
+
+
+
+```
+
+It was a real challenge to make the NUTS converge in the hierarchical case by manually tuning adapt_delta and max_treedepth.
+
+```{r}
+summary(bayesian_h2)
+```
+
+
+By checking the model summary, we see that `R_hat` is close to one and ESS is large, which implies that we had good mixing and the markov chains have converged properly. 
+
+### Model diagnostics
+
+Moving on to the posterior predictive check, we get the following plot: 
+```{r, echo = F, message=FALSE, warning=FALSE}
+pp_check(bayesian_h2, type = "scatter_avg") 
+
+pp_check(bayesian_h2, type = "scatter_avg_grouped", group = "Trt")
+```
+
+On the population-level PPC, we don't observe many differences compared to the ANCOVA model. However, in the group-level PPC, we see that the hierarchical model is able to capture the group-level trends better than the ANCOVA model, especially in the case of the +B and +N groups.
+
+We perform a check on the residual distribution before moving onto the model comparison. This is to confirm that the iid Gaussian errors assumption holds and that the model is correctly specified.
+
+```{r, echo = F}
+## Diagnostics
+
+diagnostics_df <- tgw
+
+diagnostics_df$fitted <- fitted(bayesian_h2)[, 1]
+diagnostics_df$residuals <- residuals(bayesian_h2)[, 1]
+
+  
+# Residuals vs fitted
+
+diagnostics_df %>%
+  ggplot() +
+  geom_point(aes(x = fitted, y = residuals)) 
+
+```
+
+The residuals are randomly scattered around the y = 0 line. We conclude that this is also a 
+"healthy" fit and therefore we can proceed to compare this model with the ANCOVA one, before drawing further conclusions.  
+
+## Model selection and interpretation
+
+After establishing that both models are reasonably well fit, we move on to comparing them. We also define and fit the degenerate-case model, where each observation has the exact same mean `TGW` (`Damage` and `Trt` do not have any effect), and any deviations seen from that mean are caused by iid Gaussian noise. We include this model for completeness only, and as such we do not perform the same goodness of fit checks that we performed for the other two models. 
+
+The prior for the global mean `TGW` is centered around the observed mean, and we use the same recurrent rule of thumb for the prior of the variance. 
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+prior_0 <- c(
+  set_prior(paste0("normal(", round(m_y, 2), ", ", round(3 * std_y, 2), ")"),
+            class = "Intercept"),
+  set_prior(paste0("exponential(1.0 / ", round(std_y, 2), ")"),
+            class = "sigma", lb = 0)
+)
+
+bayesian_0 <- brm(
+  formula = TGW ~ 1,
+  data    = tgw,
+  prior   = prior_0,
+  seed    = 12345678,
+  control = list(adapt_delta = 0.9)
+)
+```
+
+
+```{r, results = 'hide', message=FALSE, warning=FALSE}
+bayesian_0 <- update(bayesian_0, save_pars = save_pars(all = TRUE))
+bayesian_dros <- update(bayesian_dros, save_pars = save_pars(all = TRUE))
+bayesian_h2 <- update(bayesian_h2,   save_pars = save_pars(all = TRUE))
+
+## --- (3) Add LOO to each model ---------------------------------------------
+# moment_match = TRUE is helpful for hierarchical models and when Pareto-k > 0.7
+
+bayesian_0 <- add_criterion(bayesian_0, "loo", moment_match = TRUE)
+bayesian_dros<- add_criterion(bayesian_dros, "loo", moment_match = TRUE)
+bayesian_h2  <- add_criterion(bayesian_h2,   "loo", moment_match = TRUE)
+
+## --- (4) Compare the three models -------------------------------------------
+# Higher elpd_loo (lower LOOIC) indicates better expected out-of-sample fit
+```
+```{r}
+loo_compare( bayesian_dros,bayesian_h2, bayesian_0, criterion = "loo")
+```
+
+The results show that we cannot distinguish the two main models by their elpd_diff (se_diff is larger than elpd_diff), but we can only say that they are both significantly better than the null model. So, for the sake of interpretability, we choose the simplest model within the two, i.e. the Fixed-effect (non-hierarchical) ANCOVA model.  
+
+
+### Interpretation of the results
+
+We compare each pairwise difference between treatments, while controlling for `Damage`. This is done using Estimated Marginal Means (EMMs).
+
+```{r, message=FALSE, warning=FALSE}
+bayesian_dros_emm <- emmeans(bayesian_dros, specs = ~ Trt | Damage_c)
+
+pairs(bayesian_dros_emm)
+```
+
+Pairwise comparisons of treatment combinations in the Table above revealed that only the pairs -B vs +B and -N vs +N had credible intervals containing zero, indicating no differences between these treatment levels. This suggests that the impact of growth regulator (- vs +) was not influential. In contrast, significant differences were observed between varieties (B vs N) under both growth regulator conditions, suggesting that variety were the key factor influencing TGW. Specifically, variety N had a consistently larger `TGW` than variety B. 
+
+### Markov chain convergence
+
+While we have already checked the convergence of the markov chains using `R_hat` and `ESS`, we can also visualize the chains to ensure that they have mixed well and converged properly. Specifically, we will visualize two plots:
+1. *Trace plots*: These show the sampled values of each chain across iterations. Ideally, the chains should mix well, overlapping with each other and exploring the parameter space fully, without getting stuck in narrow regions.
+2. *Autocorrelation plots*: These show the correlation between samples at different lags. We want the autocorrelation to drop off quickly, indicating that successive samples are independent and confirm that the effective sample size (`ESS`) is high.
+
+```{r, echo = F, results='hide', warning=FALSE, message=FALSE}
+chains_list <- as.mcmc(bayesian_dros)
+effectiveSize(chains_list)
+
+
+### for checking covergence
+chains_list <- ggs(chains_list) 
+pars <- c("b_Damage_c","b_Intercept","b_Trt1","b_Trt2", "b_Trt3","sigma")
+chains_list <- chains_list[chains_list$Parameter %in% pars,]
+
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Traceplots
+ggs_traceplot(chains_list, greek = FALSE) + xlab("Post-warmup iteration")
+# autocorrelation plot
+ggs_autocorrelation(chains_list, greek = FALSE) 
+```
+
+The trace plots show that the chains have mixed well and are overlapping, indicating good convergence. The autocorrelation plots show that the autocorrelation drops off quickly, indicating that the samples are independent and that the effective sample size is high. Therefore we can conclude with high certainty that the markov chains have converged properly.
+
+# Conclusion
+
+The goal of this project was to investigate the effects of different treatments on the Thousand Grain Weight (TGW) of two seed types of oilseed rape, while controlling for the damage caused by pigeons. We compared two models: a Fixed-effect ANCOVA model and a Hierarchical model with random intercepts and random slopes for each treatment group. Both models were found to fit the data well, but we chose the simpler Fixed-effect ANCOVA model for interpretability. Pairwise comparisons showed no significant differences between -B and +B, or between -N and
++N, suggesting that the growth regulator had no meaningful effect on `TGW`.
+In contrast, significant differences between varieties indicate that variety was the main factor influencing TGW.
+
+These results are not conclusive. The experiment was limited by a small sample size, and rounding `Damage` to the nearest 10% likely obscured important information. Future studies with larger sample sizes and more precise measurements, potentially including additional covariates, are needed to confirm these findings.
